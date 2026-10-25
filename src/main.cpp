@@ -85,7 +85,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 if (cmd == "status") {
                     out = {{"started", started}, {"error", err}, {"network", node.params().name},
                            {"wallet_file", started && node.has_wallet_file()}, {"wallet_loaded", started && node.wallet_loaded()},
-                           {"datadir", node.dir()}, {"version", "0.2.2"}};
+                           {"datadir", node.dir()}, {"version", "0.2.3"}};
                 } else if (cmd == "openWallet") {
                     std::string e;
                     if (!node.open_wallet(p.value("password", ""), &e)) throw std::runtime_error(e);
