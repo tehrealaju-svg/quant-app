@@ -43,6 +43,7 @@ async function guard(fn, btn) { try { if (btn) busy(btn, true); await fn(); } ca
 // ---------------------------------------------------------------- router
 const routes = { "": home, coins, token, create, mining, network, settings, send, receive };
 async function route() {
+  view.classList.remove("full");
   status = await app("status");
   const [name, arg] = location.hash.replace(/^#\/?/, "").split("/");
   $$("[data-nav]").forEach((a) => a.classList.toggle("on", a.dataset.nav === (name || "home")));
@@ -149,21 +150,20 @@ async function receive() {
 
 // ---------------------------------------------------------------- coins
 async function coins() {
-  const sort = prefGet("app.sort") || "liquidity";
-  const r = await call("listtokens", [0, 500, sort]);
-  view.innerHTML = `<div class="page-head"><div><h1>Coins</h1><span class="muted">${r.total} coins on Quant</span></div>
-    <div class="row"><div class="seg" id="srt"><button data-s="liquidity">Top</button><button data-s="new">New</button></div><a class="btn" href="#/create">Create a coin</a></div></div>
-    <div class="card"><input class="in" id="q" placeholder="Search" style="margin-bottom:12px"><div id="tb"></div></div>`;
-  const draw = () => {
-    const q = $("#q").value.toLowerCase();
-    const list = r.tokens.filter((t) => !q || t.ticker.toLowerCase().includes(q) || t.name.toLowerCase().includes(q));
-    $("#tb").innerHTML = `<table class="t"><thead><tr><th>Coin</th><th class="num">Price (QNT)</th><th class="num">Liquidity</th><th class="num">Supply</th></tr></thead><tbody>
-      ${list.map((t) => `<tr class="click" data-id="${t.id}"><td><div class="row">${tokenIcon(t)}<div><b>${esc(t.ticker)}</b><div class="faint" style="font-size:12px">${esc(t.name)}</div></div></div></td>
-      <td class="num">${t.pool ? fmt(t.pool.price_qnt, 10) : `<span class="faint">no pool</span>`}</td><td class="num">${t.pool ? fmt(t.pool.liquidity_qnt) + " QNT" : "–"}</td><td class="num">${fmt(num(t.supply))}</td></tr>`).join("")}</tbody></table>`;
-    $$("tr.click").forEach((tr) => (tr.onclick = () => (location.hash = "#/token/" + tr.dataset.id)));
-  };
-  $$("#srt button").forEach((b) => { b.classList.toggle("on", b.dataset.s === sort); b.onclick = () => { prefSet("app.sort", b.dataset.s); coins(); }; });
-  $("#q").oninput = draw; draw();
+  view.classList.add("full");
+  view.innerHTML = `<div class="term-host"></div>`;
+  QTerminal.mount($(".term-host"), {
+    markets: (sort) => call("listmarkets", [sort, 300]),
+    history: (id) => call("getpoolhistory", [id, 2000]),
+    trades: (id) => call("getpooltrades", [id, 200]),
+    async portfolio() {
+      const [w, toks] = await Promise.all([call("getwalletinfo"), call("gettokenbalances")]);
+      return { qnt: num(w.confirmed), tokens: toks.filter((t) => !t.asset.endsWith("-SHARE")).map((t) => ({ id: t.asset_id, ticker: t.asset, amount: num(t.amount) })) };
+    },
+    quote: (id, side, amt) => call("quote", [id, side, amt]),
+    swap: (id, side, amt, slip) => call("swap", [id, side, amt, String(slip)]),
+    prefGet, prefSet, toast,
+  }, { createHref: "#/create", refreshMs: 15000 });
 }
 
 function chart(points) {
@@ -260,20 +260,51 @@ async function mining() {
 }
 
 // ---------------------------------------------------------------- network
+const mb = (b) => (b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : (b / 1e3).toFixed(0) + " KB");
+function left(until) {
+  if (until === null) return "forever";
+  const s = until - Date.now() / 1000;
+  return s <= 0 ? "ending" : s < 3600 ? Math.ceil(s / 60) + " min left" : s < 86400 ? Math.ceil(s / 3600) + " h left" : Math.ceil(s / 86400) + " days left";
+}
 async function network() {
-  const [c, peers, net, snap] = await Promise.all([call("getblockchaininfo"), call("getpeerinfo"), call("getnetworkinfo"), call("getsnapshotinfo")]);
+  const [c, peers, net, snap, bans] = await Promise.all([call("getblockchaininfo"), call("getpeerinfo"), call("getnetworkinfo"),
+    call("getsnapshotinfo"), call("listbanned").catch(() => [])]);
+  const up = peers.reduce((a, p) => a + p.bytes_out, 0), down = peers.reduce((a, p) => a + p.bytes_in, 0);
+  const seeding = peers.filter((p) => p.syncing_from_us);
   view.innerHTML = `<h1>Network</h1><div class="stats" style="margin:12px 0 16px">
     <div class="stat"><span class="muted">Height</span><b>${c.height.toLocaleString()}</b></div>
     <div class="stat"><span class="muted">Peers</span><b>${peers.length}</b></div>
-    <div class="stat"><span class="muted">Supply</span><b>${fmt(num(c.supply))}</b></div>
-    <div class="stat"><span class="muted">Disk</span><b>${(c.disk_blocks_mb + c.disk_signatures_mb + c.disk_headers_mb).toFixed(1)} MB</b></div></div>
-  <div class="grid cols-2"><div class="card"><h2>Peers</h2>${peers.length ? `<ul class="list">${peers.map((p) => `<li><div class="grow"><b class="mono">${esc(p.addr)}</b><div class="faint" style="font-size:12px">${esc(p.agent)} · height ${p.height}</div></div>
-      <div class="r faint">${p.inbound ? "in" : "out"} · ${p.ping_ms >= 0 ? Math.round(p.ping_ms) + " ms" : ""}</div></li>`).join("")}</ul>` : `<p class="muted">Looking for other Quant nodes…</p>`}</div>
+    <div class="stat"><span class="muted">Uploaded</span><b>${mb(net.bytes_out)}</b></div>
+    <div class="stat"><span class="muted">Downloaded</span><b>${mb(net.bytes_in)}</b></div></div>
+  ${seeding.length ? `<div class="notice" style="margin-bottom:16px">You're seeding the chain to ${seeding.length} new node${seeding.length > 1 ? "s" : ""}. If someone keeps re-downloading and wasting your bandwidth, ban them below.</div>` : ""}
+  <div class="card" style="margin-bottom:16px"><div class="row between wrap"><h2 style="margin:0">Peers</h2>
+      <div class="row"><input class="in mono" id="ip" placeholder="Add peer: IP or IP:port" style="width:260px"><button class="btn sm" id="add">Connect</button></div></div>
+    <p class="faint" style="font-size:13px;margin:6px 0 10px">New nodes only need the network (same genesis); peers you add here are retried over and over until they answer.</p>
+    ${peers.length ? `<div class="table-scroll"><table class="t"><thead><tr><th>Address</th><th>Client</th><th class="num">Height</th><th class="num">Ping</th>
+      <th class="num">Sent to them</th><th class="num">From them</th><th class="num">Blocks sent</th><th>Ban</th></tr></thead><tbody>
+      ${peers.map((p) => `<tr><td class="mono selectable">${esc(p.addr)} <span class="faint">${p.inbound ? "in" : "out"}</span>${p.syncing_from_us ? ` <span class="pill brand">syncing from you</span>` : ""}</td>
+        <td class="faint">${esc(p.agent)}</td><td class="num">${p.height.toLocaleString()}</td><td class="num">${p.ping_ms >= 0 ? Math.round(p.ping_ms) + " ms" : "–"}</td>
+        <td class="num">${mb(p.bytes_out)}</td><td class="num">${mb(p.bytes_in)}</td><td class="num">${p.blocks_sent.toLocaleString()}</td>
+        <td><select class="in" data-ban="${esc(p.addr)}" style="min-height:32px;padding:4px 8px;width:auto"><option value="">Ban…</option><option>24h</option><option>7d</option><option>31d</option><option>forever</option></select></td></tr>`).join("")}
+      </tbody></table></div>` : `<p class="muted">No peers yet. Looking on the DHT and your local network; add an IP above to connect directly.</p>`}</div>
+  <div class="grid cols-2">
+    <div class="card"><div class="row between"><h2 style="margin:0">Banned IPs</h2><span class="faint">${bans.length}</span></div>
+      <div class="row wrap" style="margin:12px 0"><input class="in mono" id="bip" placeholder="IP to ban" style="flex:1 1 160px"><select class="in" id="bdur" style="width:auto"><option>24h</option><option>7d</option><option>31d</option><option>forever</option></select><button class="btn ghost sm" id="bgo">Ban</button></div>
+      ${bans.length ? `<ul class="list">${bans.map((b) => `<li><div class="grow"><b class="mono selectable">${esc(b.ip)}</b><div class="faint" style="font-size:12px">${esc(b.reason)}</div></div>
+        <span class="pill">${left(b.until)}</span><button class="btn line sm" data-unban="${esc(b.ip)}">Unban</button></li>`).join("")}</ul>` : `<p class="muted">Nobody is banned.</p>`}</div>
     <div class="card"><h2>This node</h2><dl class="kv"><dt>Network</dt><dd>${esc(c.network)}</dd><dt>Syncing</dt><dd>${c.syncing ? "yes" : "no"}</dd>
       <dt>Discovery</dt><dd>${esc(net.dht)}</dd><dt>Port mapping</dt><dd>${esc(net.upnp)}</dd><dt>Public address</dt><dd>${esc(net.external_address || "–")}</dd>
-      <dt>Signatures kept</dt><dd>${c.disk_signatures_mb.toFixed(1)} MB (pruned after a week)</dd><dt>Next state snapshot</dt><dd>block ${snap.next_snapshot_height.toLocaleString()}</dd></dl>
+      <dt>Port</dt><dd>${net.port}</dd><dt>Signatures kept</dt><dd>${c.disk_signatures_mb.toFixed(1)} MB (pruned after a week)</dd>
+      <dt>Next state snapshot</dt><dd>block ${snap.next_snapshot_height.toLocaleString()}</dd></dl>
       <button class="btn line sm" id="dd" style="margin-top:12px">Open data folder</button></div></div>`;
   $("#dd").onclick = () => app("openDataDir");
+  $("#add").onclick = () => guard(async () => { await call("addnode", [$("#ip").value.trim()]); toast("Connecting… it keeps retrying until they answer"); setTimeout(network, 2500); }, $("#add"));
+  $("#bgo").onclick = () => guard(async () => { await call("setban", [$("#bip").value.trim(), $("#bdur").value, "banned by you"]); toast("Banned"); setTimeout(network, 600); }, $("#bgo"));
+  $$("[data-ban]").forEach((s) => (s.onchange = () => s.value && guard(async () => {
+    const ip = s.dataset.ban.replace(/^\[(.*)\](:\d+)?$/, "$1").replace(/:\d+$/, "");
+    await call("setban", [ip, s.value, "wasting bandwidth"]); toast(`Banned ${ip} (${s.value})`); setTimeout(network, 600);
+  })));
+  $$("[data-unban]").forEach((b) => (b.onclick = () => guard(async () => { await call("clearban", [b.dataset.unban]); setTimeout(network, 600); })));
 }
 
 // ---------------------------------------------------------------- settings
