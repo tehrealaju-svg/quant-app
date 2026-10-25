@@ -41,7 +41,7 @@ function tokenIcon(t) {
 async function guard(fn, btn) { try { if (btn) busy(btn, true); await fn(); } catch (e) { toast(e.message || String(e), 5000); } finally { if (btn) busy(btn, false); } }
 
 // ---------------------------------------------------------------- router
-const routes = { "": home, coins, token, create, mining, network, settings, send, receive };
+const routes = { "": home, coins, messages, token, create, mining, network, settings, send, receive };
 async function route() {
   view.classList.remove("full");
   status = await app("status");
@@ -308,6 +308,107 @@ async function network() {
 }
 
 // ---------------------------------------------------------------- settings
+// ---------------------------------------------------------------- messages (on-chain chat + gifts)
+const shortAddr = (a) => (a.length > 22 ? a.slice(0, 10) + "…" + a.slice(-8) : a);
+const names = () => { try { return JSON.parse(prefGet("quant.names") || "{}"); } catch { return {}; } };
+const nameOf = (a) => names()[a] || shortAddr(a);
+function avatar(a) {
+  let h = 0; for (const c of a) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `<span class="av" style="background:hsl(${h % 360} 65% 48%)">${esc((names()[a] || a.split("1").slice(1).join("1")).slice(0, 1).toUpperCase())}</span>`;
+}
+let chatTimer = null;
+async function loadMessages() {
+  const addrs = (await call("listaddresses")).map((a) => a.address);
+  const mine = new Set(addrs);
+  const lists = await Promise.all(addrs.map((a) => call("getmessages", [a, 500]).catch(() => [])));
+  const seen = new Map();
+  // The node lists newest first; walk oldest first so same-block messages keep their order.
+  for (const l of lists) for (const m of [...l].reverse()) if (!seen.has(m.txid)) seen.set(m.txid, { ...m, me: mine.has(m.from), other: mine.has(m.from) ? m.to : m.from });
+  const convos = new Map();
+  for (const m of seen.values()) { if (!convos.has(m.other)) convos.set(m.other, []); convos.get(m.other).push(m); }
+  const t = (m) => (m.pending ? Infinity : m.time);
+  for (const v of convos.values()) v.sort((a, b) => t(a) - t(b));
+  return [...convos.entries()].sort((a, b) => t(b[1][b[1].length - 1]) - t(a[1][a[1].length - 1]));
+}
+async function messages(peer) {
+  clearInterval(chatTimer);
+  let convos = await loadMessages();
+  if (peer && !convos.some(([a]) => a === peer)) convos.unshift([peer, []]);
+  const seenGifts = new Set(JSON.parse(prefGet("quant.seenGifts") || "[]"));
+  const when = (m) => `<span class="when ${m.pending ? "pend" : ""}">${m.pending ? "" : new Date(m.time * 1000).toLocaleString()}</span>`;
+  const paint = () => {
+    const cur = convos.find(([a]) => a === peer);
+    const preview = (m) => (m.gift ? `${m.me ? "You sent" : "Sent you"} a ${GIFTS[m.gift].label.toLowerCase()}` : (m.me ? "You: " : "") + m.text);
+    view.innerHTML = `<div class="page-head"><div><h1>Messages</h1><span class="muted">Stored on the Quant chain, so anyone can read them. Gifts pay their price to the person you send them to.</span></div>
+      <button class="btn" id="newc">New chat</button></div>
+      <div class="chat card ${peer ? "open" : ""}">
+        <div class="chat-list">${convos.length ? convos.map(([a, ms]) => `<a class="chat-item ${a === peer ? "on" : ""}" href="#/messages/${encodeURIComponent(a)}">${avatar(a)}
+          <div class="meta"><div class="nm">${esc(nameOf(a))}</div><div class="last">${ms.length ? esc(preview(ms[ms.length - 1])) : "New chat"}</div></div></a>`).join("")
+          : `<p class="muted" style="padding:12px">No messages yet. Start a chat with any Quant address.</p>`}</div>
+        <div class="thread">${cur ? `
+          <div class="thread-head"><a class="btn ghost sm" href="#/messages">←</a>${avatar(peer)}<div style="min-width:0"><div style="font-weight:700">${esc(nameOf(peer))}</div><div class="mono muted selectable" style="font-size:12px">${esc(peer)}</div></div>
+            <div class="grow"></div><button class="btn ghost sm" id="nick">Rename</button></div>
+          <div class="bubbles" id="bub">${cur[1].map((m) => m.gift
+            ? `<div class="bubble giftb ${m.me ? "me" : ""}" data-g="${m.gift}">${giftArt(m.gift, true)}<span class="gname">${GIFTS[m.gift].label} · ${GIFTS[m.gift].price} QNT</span>${m.text ? `<span>${esc(m.text)}</span>` : ""}${when(m)}</div>`
+            : `<div class="bubble selectable ${m.me ? "me" : ""}">${esc(m.text)}${when(m)}</div>`).join("") || `<p class="muted" style="text-align:center">Say hi — or send a gift.</p>`}</div>
+          <div id="gsel"></div>
+          <div class="composer"><button class="btn ghost" id="gbtn" title="Send a gift">🎁</button><textarea class="in" id="txt" maxlength="280" rows="1" placeholder="Message"></textarea><button class="btn" id="snd">Send</button></div>`
+          : `<div class="muted" style="margin:auto;text-align:center">Pick a chat</div>`}</div>
+      </div>`;
+    $("#newc").onclick = () => {
+      const m = modal(`<h2>New chat</h2><label class="f">Their Quant address</label><input class="in mono" id="a" spellcheck="false"><button class="btn block" id="go" style="margin-top:12px">Open chat</button>`);
+      $("#go", m).onclick = () => guard(async () => {
+        const a = $("#a", m).value.trim();
+        if (!(await call("validateaddress", [a])).valid) throw new Error("That isn't a valid Quant address");
+        m.remove(); location.hash = "#/messages/" + encodeURIComponent(a);
+      });
+    };
+    if (!cur) return;
+    const bub = $("#bub"); bub.scrollTop = bub.scrollHeight;
+    $$(".bubble.giftb", bub).forEach((b) => (b.onclick = () => giftBurst(+b.dataset.g)));
+    const fresh = cur[1].filter((m) => m.gift && !m.me && !m.pending && !seenGifts.has(m.txid));
+    if (fresh.length) { giftBurst(fresh[fresh.length - 1].gift); fresh.forEach((m) => seenGifts.add(m.txid)); prefSet("quant.seenGifts", JSON.stringify([...seenGifts].slice(-500))); }
+    $("#nick").onclick = () => {
+      const m = modal(`<h2>Rename</h2><input class="in" id="n" maxlength="40" value="${esc(names()[peer] || "")}"><button class="btn block" id="ok" style="margin-top:12px">Save</button>`);
+      $("#ok", m).onclick = () => { const all = names(), n = $("#n", m).value.trim(); if (n) all[peer] = n; else delete all[peer]; prefSet("quant.names", JSON.stringify(all)); m.remove(); paint(); };
+    };
+    let gift = 0;
+    const showGift = () => {
+      $("#gsel").innerHTML = gift ? `<div class="row" style="padding-top:10px"><span class="gift-chip">${giftArt(gift)}${GIFTS[gift].label} · ${GIFTS[gift].price} QNT</span><button class="btn ghost sm" id="gx">Remove</button></div>` : "";
+      if (gift) $("#gx").onclick = () => { gift = 0; showGift(); };
+    };
+    $("#gbtn").onclick = () => {
+      const m = modal(`<h2>Send a gift</h2><p class="muted" style="margin:0">The price goes to ${esc(nameOf(peer))}.</p>
+        <div class="gift-pick">${GIFTS.filter(Boolean).map((g) => `<button class="gift-opt" data-id="${g.id}">${giftArt(g.id)}<b>${g.label}</b><span class="p">${g.price} QNT</span></button>`).join("")}</div>`);
+      $$(".gift-opt", m).forEach((b) => (b.onclick = () => { gift = +b.dataset.id; m.remove(); showGift(); $("#txt").focus(); }));
+    };
+    const txt = $("#txt");
+    txt.oninput = () => { txt.style.height = "auto"; txt.style.height = Math.min(txt.scrollHeight, 140) + "px"; };
+    txt.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#snd").click(); } };
+    $("#snd").onclick = (e) => guard(async () => {
+      const text = txt.value.trim();
+      if (!text && !gift) return;
+      if (new TextEncoder().encode(text).length > 280) throw new Error("Messages are at most 280 bytes");
+      await call("sendmessage", [peer, text, GIFTS[gift]?.name || "none"]);
+      if (gift) giftBurst(gift);
+      txt.value = ""; gift = 0;
+      convos = await loadMessages();
+      if (!convos.some(([a]) => a === peer)) convos.unshift([peer, []]);
+      paint();
+    }, e.target);
+  };
+  paint();
+  chatTimer = setInterval(async () => {
+    if (!location.hash.startsWith("#/messages")) return clearInterval(chatTimer);
+    if ($("#txt")?.value) return;
+    const next = await loadMessages().catch(() => null);
+    if (!next || JSON.stringify(next) === JSON.stringify(convos.filter(([, m]) => m.length))) return;
+    convos = next;
+    if (peer && !convos.some(([a]) => a === peer)) convos.unshift([peer, []]);
+    paint();
+  }, 8000);
+}
+
 async function settings() {
   const theme = prefGet("quant.theme") || "system";
   const adv = prefGet("quant.adv") === "1" || theme === "amoled";
